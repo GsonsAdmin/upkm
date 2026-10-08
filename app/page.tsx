@@ -1,19 +1,29 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { BrowserMultiFormatReader } from "@zxing/browser";
 
 type SerialRow = { page: number; sticker: string; gm: string };
+type ScanResult = { value: string; raw: string; status: string };
 
 const workflow = [
   ["01", "Supplier serial master", "Import the brand PDF and verify every sticker."],
   ["02", "Create production batch", "Assign brand, model, line and planned quantity."],
-  ["03", "Scan at station", "USB 2D scanner is the primary input."],
+  ["03", "Scan with mobile camera", "Use the rear camera to scan the supplier QR sticker."],
   ["04", "Validate instantly", "Accept, duplicate, invalid and sequence-gap checks."],
   ["05", "Reconcile", "Close the batch only after every serial is accounted for."],
 ];
 
 function Stat({ label, value, note }: { label: string; value: string; note: string }) {
   return <article className="stat-card"><div className="eyebrow">{label}</div><div className="stat-value">{value}</div><div className="muted">{note}</div></article>;
+}
+
+function extractSerial(value: string) {
+  const normalized = value.trim();
+  const gm = normalized.match(/GM\d+/i)?.[0]?.toUpperCase() || "";
+  const sn = normalized.match(/(?:^|\/)SN(\d+)/i)?.[1] || "";
+  const sticker = sn ? `P-${sn}` : normalized.match(/P-\d+/i)?.[0]?.toUpperCase() || "";
+  return { canonical: gm || sticker || normalized, gm, sticker };
 }
 
 export default function Home() {
@@ -23,11 +33,57 @@ export default function Home() {
   const [importError, setImportError] = useState("");
   const [serials, setSerials] = useState<SerialRow[]>([]);
   const [scan, setScan] = useState("");
-  const [lastScan, setLastScan] = useState<{ value: string; status: string } | null>(null);
+  const [lastScan, setLastScan] = useState<ScanResult | null>(null);
   const [scanned, setScanned] = useState<string[]>([]);
+  const [cameraOn, setCameraOn] = useState(false);
+  const [cameraError, setCameraError] = useState("");
   const scannerRef = useRef<HTMLInputElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const cameraControlsRef = useRef<any>(null);
+  const lastCameraValueRef = useRef("");
+  const lastCameraTimeRef = useRef(0);
 
-  useEffect(() => { if (tab === "operator") scannerRef.current?.focus(); }, [tab]);
+  useEffect(() => {
+    if (tab === "operator" && !cameraOn) scannerRef.current?.focus();
+  }, [tab, cameraOn]);
+
+  useEffect(() => () => stopCamera(), []);
+
+  function stopCamera() {
+    try { cameraControlsRef.current?.stop(); } catch {}
+    cameraControlsRef.current = null;
+    if (videoRef.current?.srcObject) {
+      (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
+    setCameraOn(false);
+  }
+
+  async function startCamera() {
+    setCameraError("");
+    if (!videoRef.current) return;
+    try {
+      const reader = new BrowserMultiFormatReader();
+      const controls = await reader.decodeFromConstraints(
+        { video: { facingMode: { ideal: "environment" } }, audio: false },
+        videoRef.current,
+        (result) => {
+          if (!result) return;
+          const raw = result.getText().trim();
+          const now = Date.now();
+          if (raw === lastCameraValueRef.current && now - lastCameraTimeRef.current < 1500) return;
+          lastCameraValueRef.current = raw;
+          lastCameraTimeRef.current = now;
+          handleScan(raw);
+        }
+      );
+      cameraControlsRef.current = controls;
+      setCameraOn(true);
+    } catch (e: any) {
+      setCameraError(e?.message || "Camera could not be started. Please allow camera access and use HTTPS.");
+      setCameraOn(false);
+    }
+  }
 
   async function importPdf(file: File) {
     setImporting(true); setImportError(""); setSerials([]); setFileName(file.name);
@@ -53,15 +109,18 @@ export default function Home() {
     } finally { setImporting(false); }
   }
 
-  function handleScan(value: string) {
-    const normalized = value.trim();
-    if (!normalized) return;
-    const known = serials.length ? serials.find(s => s.gm === normalized || s.sticker === normalized) : null;
-    const already = scanned.includes(normalized);
-    if (already) setLastScan({ value: normalized, status: "DUPLICATE" });
-    else if (serials.length && !known) setLastScan({ value: normalized, status: "INVALID" });
-    else { setScanned(prev => [...prev, normalized]); setLastScan({ value: normalized, status: "ACCEPTED" }); }
-    setScan(""); requestAnimationFrame(() => scannerRef.current?.focus());
+  function handleScan(rawValue: string) {
+    const raw = rawValue.trim();
+    if (!raw) return;
+    const parsed = extractSerial(raw);
+    const known = serials.length ? serials.find(s => s.gm === parsed.gm || s.sticker === parsed.sticker || s.gm === parsed.canonical || s.sticker === parsed.canonical) : null;
+    const canonical = known?.gm || parsed.canonical;
+    const already = scanned.includes(canonical);
+    if (already) setLastScan({ value: canonical, raw, status: "DUPLICATE" });
+    else if (serials.length && !known) setLastScan({ value: canonical, raw, status: "INVALID" });
+    else { setScanned(prev => [...prev, canonical]); setLastScan({ value: canonical, raw, status: "ACCEPTED" }); }
+    setScan("");
+    if (!cameraOn) requestAnimationFrame(() => scannerRef.current?.focus());
   }
 
   const production = serials.length ? scanned.filter(v => serials.some(s => s.gm === v || s.sticker === v)).length : scanned.length;
@@ -76,12 +135,17 @@ export default function Home() {
         <section className="hero"><div><div className="eyebrow">LIVE PRODUCTION CONTROL</div><h1>Production Serial Tracking</h1><p>Track every supplier-issued sticker from PDF import to final batch reconciliation.</p></div><div className="hero-chip">Bajaj · RD60 test dataset</div></section>
         <section className="stats-grid"><Stat label="Live Production" value={`${production} / ${serials.length || 0}`} note={serials.length ? `${percent}% complete` : "Waiting for supplier serial master"} /><Stat label="Missing / Gaps" value={serials.length ? String(Math.max(serials.length - production, 0)) : "0"} note="Pending reconciliation" /><Stat label="Duplicates" value={lastScan?.status === "DUPLICATE" ? "1" : "0"} note="Duplicate attempts retained" /><Stat label="Invalid Scans" value={lastScan?.status === "INVALID" ? "1" : "0"} note="Rejected before production count" /></section>
         <section className="panel"><div className="section-head"><div><div className="eyebrow">WORKFLOW</div><h2>Production control flow</h2></div><button className="primary" onClick={() => setTab("import")}>Import Supplier PDF</button></div><div className="workflow-grid">{workflow.map(([n,t,d]) => <div className="workflow-card" key={n}><span>{n}</span><h3>{t}</h3><p>{d}</p></div>)}</div></section>
-        <section className="two-col"><div className="dark-panel"><div className="eyebrow">OPERATOR STATION</div><h2>{lastScan ? lastScan.status : "Ready for scanner"}</h2><p>Use a USB 2D scanner in HID/keyboard mode with an Enter suffix. The focused input accepts the scanner output without mouse interaction.</p><button className="light-button" onClick={() => setTab("operator")}>Open Operator Station</button></div><div className="panel"><div className="eyebrow">CURRENT SUPPLIER FILE</div><h2>{fileName || "No PDF imported"}</h2><p className="muted">{serials.length ? `${serials.length.toLocaleString()} serial records extracted.` : "Import the Bajaj RD60 PDF to start the first real test."}</p>{serials.length > 0 && <div className="mini-table"><b>{serials[0].sticker}</b><span>{serials[0].gm}</span><b>{serials.at(-1)?.sticker}</b><span>{serials.at(-1)?.gm}</span></div>}</div></section>
+        <section className="two-col"><div className="dark-panel"><div className="eyebrow">OPERATOR STATION</div><h2>{lastScan ? lastScan.status : "Ready for mobile camera"}</h2><p>Use the phone rear camera to scan the supplier QR. The same validation flow remains ready for a USB 2D scanner later.</p><button className="light-button" onClick={() => setTab("operator")}>Open Operator Station</button></div><div className="panel"><div className="eyebrow">CURRENT SUPPLIER FILE</div><h2>{fileName || "No PDF imported"}</h2><p className="muted">{serials.length ? `${serials.length.toLocaleString()} serial records extracted.` : "Import the Bajaj RD60 PDF to start the first real test."}</p>{serials.length > 0 && <div className="mini-table"><b>{serials[0].sticker}</b><span>{serials[0].gm}</span><b>{serials.at(-1)?.sticker}</b><span>{serials.at(-1)?.gm}</span></div>}</div></section>
       </>}
 
-      {tab === "import" && <section className="panel import-panel"><div className="eyebrow">SUPPLIER SERIAL MASTER</div><h1>Import brand PDF</h1><p className="muted">The first production test is the Bajaj RD60 file. The importer reads the printed P-number and GM serial from each PDF page. QR payload verification will be added to the final import validation.</p><label className="dropzone"><input type="file" accept="application/pdf" onChange={e => e.target.files?.[0] && importPdf(e.target.files[0])} /><strong>{importing ? "Reading PDF…" : "Choose supplier PDF"}</strong><span>{fileName || "PDF up to the supplier batch size"}</span></label>{importError && <div className="alert error">{importError}</div>}{serials.length > 0 && <><div className="import-summary"><div><span>Pages</span><strong>{new Set(serials.map(s => s.page)).size.toLocaleString()}</strong></div><div><span>Serials</span><strong>{serials.length.toLocaleString()}</strong></div><div><span>First</span><strong>{serials[0].gm}</strong></div><div><span>Last</span><strong>{serials.at(-1)?.gm}</strong></div></div><div className="table-wrap"><table><thead><tr><th>Page</th><th>Sticker</th><th>GM Serial</th></tr></thead><tbody>{serials.slice(0, 20).map(s => <tr key={`${s.page}-${s.sticker}`}><td>{s.page}</td><td>{s.sticker}</td><td>{s.gm}</td></tr>)}</tbody></table></div><p className="muted small">Showing the first 20 records. Full extraction is held in memory for this test build; the next database migration will persist the complete import.</p></>}</section>}
+      {tab === "import" && <section className="panel import-panel"><div className="eyebrow">SUPPLIER SERIAL MASTER</div><h1>Import brand PDF</h1><p className="muted">The importer reads the printed P-number and GM serial from each PDF page. Mobile QR scanning accepts the full supplier QR payload and extracts the GM serial / P-number for validation.</p><label className="dropzone"><input type="file" accept="application/pdf" onChange={e => e.target.files?.[0] && importPdf(e.target.files[0])} /><strong>{importing ? "Reading PDF…" : "Choose supplier PDF"}</strong><span>{fileName || "PDF up to the supplier batch size"}</span></label>{importError && <div className="alert error">{importError}</div>}{serials.length > 0 && <><div className="import-summary"><div><span>Pages</span><strong>{new Set(serials.map(s => s.page)).size.toLocaleString()}</strong></div><div><span>Serials</span><strong>{serials.length.toLocaleString()}</strong></div><div><span>First</span><strong>{serials[0].gm}</strong></div><div><span>Last</span><strong>{serials.at(-1)?.gm}</strong></div></div><div className="table-wrap"><table><thead><tr><th>Page</th><th>Sticker</th><th>GM Serial</th></tr></thead><tbody>{serials.slice(0, 20).map(s => <tr key={`${s.page}-${s.sticker}`}><td>{s.page}</td><td>{s.sticker}</td><td>{s.gm}</td></tr>)}</tbody></table></div><p className="muted small">Showing the first 20 records. Full extraction is held in memory for this test build; the next database migration will persist the complete import.</p></>}</section>}
 
-      {tab === "operator" && <section className="operator-layout"><div className="operator-main"><div className="eyebrow">OPERATOR STATION · USB 2D SCANNER</div><h1>Scan Serial</h1><p className="muted">Keep this page focused. Scan the sticker and the scanner should automatically send Enter.</p><div className="counter">{production} <span>/ {serials.length || "—"}</span></div><div className="progress"><i style={{ width: `${Math.min(percent,100)}%` }} /></div><div className="scan-box"><div className="eyebrow">SCAN INPUT</div><input ref={scannerRef} autoFocus value={scan} onChange={e => setScan(e.target.value)} onKeyDown={e => { if (e.key === "Enter") handleScan(scan); }} placeholder="Ready for USB scanner…" /><button className="primary" onClick={() => handleScan(scan)}>Validate Scan</button></div>{lastScan && <div className={`scan-result ${lastScan.status.toLowerCase()}`}><strong>{lastScan.status}</strong><span>{lastScan.value}</span></div>}</div><aside className="operator-side"><div className="panel"><div className="eyebrow">BATCH</div><h2>Bajaj · RD60</h2><p className="muted">Supplier file: {fileName || "Not imported"}</p><div className="side-stat"><span>Target</span><strong>{serials.length || 0}</strong></div><div className="side-stat"><span>Produced</span><strong>{production}</strong></div><div className="side-stat"><span>Remaining</span><strong>{Math.max((serials.length || 0)-production,0)}</strong></div></div><div className="dark-panel"><div className="eyebrow">LAST SCAN</div><h2>{lastScan?.status || "Waiting"}</h2><p>{lastScan?.value || "Scan a supplier sticker to validate it."}</p></div></aside></section>}
+      {tab === "operator" && <section className="operator-layout"><div className="operator-main"><div className="eyebrow">OPERATOR STATION · MOBILE CAMERA</div><h1>Scan Serial</h1><p className="muted">Open this page on the production phone and use the rear camera. The QR payload is validated against the imported supplier serial master.</p><div className="counter">{production} <span>/ {serials.length || "—"}</span></div><div className="progress"><i style={{ width: `${Math.min(percent,100)}%` }} /></div>
+        <div className="camera-box"><div className="camera-frame">{cameraOn ? <video ref={videoRef} autoPlay muted playsInline /> : <div className="camera-placeholder"><div className="camera-icon">⌁</div><strong>Camera scanner ready</strong><span>Tap Start Camera and allow camera access.</span></div>}</div><div className="camera-actions">{cameraOn ? <button className="light-button" onClick={stopCamera}>Stop Camera</button> : <button className="primary" onClick={startCamera}>Start Camera Scanner</button>}</div>{cameraError && <div className="alert error">{cameraError}</div>}</div>
+        <div className="scan-box"><div className="eyebrow">MANUAL / FUTURE 2D SCANNER INPUT</div><input ref={scannerRef} autoFocus={!cameraOn} value={scan} onChange={e => setScan(e.target.value)} onKeyDown={e => { if (e.key === "Enter") handleScan(scan); }} placeholder="Paste QR payload or use USB scanner later…" /><button className="primary" onClick={() => handleScan(scan)}>Validate Scan</button></div>
+        {lastScan && <div className={`scan-result ${lastScan.status.toLowerCase()}`}><strong>{lastScan.status}</strong><span>{lastScan.value}</span></div>}
+        {lastScan?.raw && lastScan.raw !== lastScan.value && <div className="raw-scan"><span>QR payload</span><code>{lastScan.raw}</code></div>}
+      </div><aside className="operator-side"><div className="panel"><div className="eyebrow">BATCH</div><h2>Bajaj · RD60</h2><p className="muted">Supplier file: {fileName || "Not imported"}</p><div className="side-stat"><span>Target</span><strong>{serials.length || 0}</strong></div><div className="side-stat"><span>Produced</span><strong>{production}</strong></div><div className="side-stat"><span>Remaining</span><strong>{Math.max((serials.length || 0)-production,0)}</strong></div></div><div className="dark-panel"><div className="eyebrow">LAST SCAN</div><h2>{lastScan?.status || "Waiting"}</h2><p>{lastScan?.value || "Scan a supplier sticker to validate it."}</p></div></aside></section>}
     </main>
   );
 }
